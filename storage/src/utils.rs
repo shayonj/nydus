@@ -14,9 +14,9 @@ use nydus_utils::{
     digest::{self, RafsDigest},
     round_down_4k,
 };
-use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::cmp::{self, min};
 use std::io::{ErrorKind, IoSliceMut, Result};
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
@@ -329,20 +329,71 @@ pub fn readahead(fd: libc::c_int, mut offset: u64, end: u64) {
     }
 }
 
-/// A customized buf allocator that avoids zeroing
-pub fn alloc_buf(size: usize) -> Vec<u8> {
-    assert!(size < isize::MAX as usize);
-    if size == 0 {
-        return Vec::new();
+#[repr(align(4096))]
+#[derive(Clone)]
+struct BufferPage {
+    _bytes: [u8; 4096],
+}
+
+/// An initialized byte buffer backed by 4 KiB aligned pages.
+#[derive(Default)]
+pub struct AlignedBuf {
+    pages: Vec<BufferPage>,
+    len: usize,
+}
+
+impl AlignedBuf {
+    pub fn capacity(&self) -> usize {
+        self.pages.len() * 4096
     }
-    let layout = Layout::from_size_align(size, 0x1000)
-        .unwrap()
-        .pad_to_align();
-    let ptr = unsafe { alloc(layout) };
-    if ptr.is_null() {
-        handle_alloc_error(layout);
+
+    pub fn as_slice(&self) -> &[u8] {
+        self
     }
-    unsafe { Vec::from_raw_parts(ptr, size, layout.size()) }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self
+    }
+
+    pub fn resize(&mut self, len: usize, value: u8) {
+        let old_len = self.len;
+        self.pages
+            .resize(len.div_ceil(4096), BufferPage { _bytes: [0; 4096] });
+        self.len = len;
+        if len > old_len {
+            self[old_len..].fill(value);
+        }
+    }
+}
+
+impl Deref for AlignedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // Every page is initialized, contains no padding, and remains owned by this buffer.
+        unsafe { std::slice::from_raw_parts(self.pages.as_ptr().cast::<u8>(), self.len) }
+    }
+}
+
+impl DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // The exclusive borrow covers initialized pages for the lifetime of the slice.
+        unsafe { std::slice::from_raw_parts_mut(self.pages.as_mut_ptr().cast::<u8>(), self.len) }
+    }
+}
+
+impl AsRef<[u8]> for AlignedBuf {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+/// Allocate initialized storage aligned for direct IO.
+pub fn alloc_buf(size: usize) -> AlignedBuf {
+    AlignedBuf {
+        pages: vec![BufferPage { _bytes: [0; 4096] }; size.div_ceil(4096)],
+        len: size,
+    }
 }
 
 /// Check hash of data matches provided one
@@ -440,6 +491,26 @@ mod tests {
         let buf = alloc_buf(0);
         assert!(buf.is_empty());
         assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn aligned_buffers_keep_initialized_pages_through_resize() {
+        for size in [0, 1, 4095, 4096, 4097, 65537] {
+            let mut buf = alloc_buf(size);
+            assert_eq!(buf.len(), size);
+            assert_eq!(buf.capacity(), size.div_ceil(4096) * 4096);
+            assert_eq!(buf.as_ptr() as usize % 4096, 0);
+            assert!(buf.iter().all(|byte| *byte == 0));
+            buf.fill(7);
+            buf.resize(buf.capacity(), 0);
+            assert!(buf[..size].iter().all(|byte| *byte == 7));
+            assert!(buf[size..].iter().all(|byte| *byte == 0));
+            let previous = buf.len();
+            buf.resize(previous + 4097, 9);
+            assert_eq!(buf.as_ptr() as usize % 4096, 0);
+            assert!(buf[..size].iter().all(|byte| *byte == 7));
+            assert!(buf[previous..].iter().all(|byte| *byte == 9));
+        }
     }
 
     #[test]

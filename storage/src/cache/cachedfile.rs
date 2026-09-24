@@ -37,7 +37,7 @@ use crate::device::{
     BlobObject, BlobPrefetchRequest,
 };
 use crate::meta::{BlobCompressionContextInfo, BlobMetaChunk};
-use crate::utils::{alloc_buf, copyv, readv, MemSliceCursor};
+use crate::utils::{alloc_buf, copyv, readv, AlignedBuf, MemSliceCursor};
 use crate::{StorageError, StorageResult, RAFS_BATCH_SIZE_TO_GAP_SHIFT, RAFS_DEFAULT_CHUNK_SIZE};
 
 const DOWNLOAD_META_RETRY_COUNT: u32 = 5;
@@ -1026,7 +1026,7 @@ impl FileCacheEntry {
         Ok(())
     }
 
-    fn adjust_buffer_for_dio(&self, buf: &mut Vec<u8>) {
+    fn adjust_buffer_for_dio(&self, buf: &mut AlignedBuf) {
         assert_eq!(buf.capacity() % 0x1000, 0);
         if buf.len() != buf.capacity() {
             // Padding with 0 for direct IO.
@@ -1513,7 +1513,7 @@ impl Drop for FileCacheEntry {
 #[allow(dead_code)]
 enum DataBuffer {
     Reuse(ManuallyDrop<Vec<u8>>),
-    Allocated(Vec<u8>),
+    Allocated(AlignedBuf),
 }
 
 impl DataBuffer {
@@ -1541,7 +1541,9 @@ impl DataBuffer {
     /// Make sure it owns the underlying memory buffer.
     fn convert_to_owned_buffer(self) -> Self {
         if let DataBuffer::Reuse(data) = self {
-            DataBuffer::Allocated((*data).to_vec())
+            let mut owned = alloc_buf(data.len());
+            owned.copy_from_slice(&data);
+            DataBuffer::Allocated(owned)
         } else {
             self
         }
