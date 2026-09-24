@@ -12,7 +12,7 @@ use crate::meta::BlobMetaChunkInfo;
 /// Context information to support batch chunk.
 /// Each one corresponds to a whole batch chunk containing multiple small chunks.
 #[repr(C, packed)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct BatchInflateContext {
     /// Compressed size of the whole batch chunk data.
     compressed_size: u32,

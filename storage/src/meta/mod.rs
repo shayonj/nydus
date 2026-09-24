@@ -28,7 +28,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io::Result;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::size_of;
 use std::ops::{Add, BitAnd, Not};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -471,66 +471,37 @@ impl BlobCompressionContextInfo {
         }
 
         let chunk_infos = BlobMetaChunkArray::from_file_map(&filemap, blob_info)?;
-        let chunk_infos = ManuallyDrop::new(chunk_infos);
         let mut state = BlobCompressionContext {
             blob_index: blob_info.blob_index(),
             blob_features: blob_info.features().bits(),
             compressed_size: blob_info.compressed_data_size(),
             uncompressed_size: round_up_4k(blob_info.uncompressed_size()),
             chunk_info_array: chunk_infos,
-            blob_meta_file_map: filemap,
             ..Default::default()
         };
 
+        let header =
+            unsafe { filemap.get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size) }?;
         if blob_info.has_feature(BlobFeatures::BATCH) {
-            let header = unsafe {
-                state
-                    .blob_meta_file_map
-                    .get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size)
-            }?;
-            let inflate_offset = header.s_ci_zran_offset as usize;
-            let inflate_count = header.s_ci_zran_count as usize;
-            let batch_inflate_size = inflate_count * size_of::<BatchInflateContext>();
-            let ptr = state
-                .blob_meta_file_map
-                .validate_range(inflate_offset, batch_inflate_size)?;
-            let array = unsafe {
-                Vec::from_raw_parts(
-                    ptr as *mut u8 as *mut BatchInflateContext,
-                    inflate_count,
-                    inflate_count,
+            state.batch_info_array = unsafe {
+                filemap.get_slice::<BatchInflateContext>(
+                    header.s_ci_zran_offset as usize,
+                    header.s_ci_zran_count as usize,
                 )
-            };
-            state.batch_info_array = ManuallyDrop::new(array);
+            }?
+            .to_vec();
         } else if blob_info.has_feature(BlobFeatures::ZRAN) {
-            let header = unsafe {
-                state
-                    .blob_meta_file_map
-                    .get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size)
-            }?;
             let zran_offset = header.s_ci_zran_offset as usize;
             let zran_count = header.s_ci_zran_count as usize;
-            let ci_zran_size = header.s_ci_zran_size as usize;
+            state.zran_info_array =
+                unsafe { filemap.get_slice::<ZranInflateContext>(zran_offset, zran_count) }?
+                    .to_vec();
             let zran_size = zran_count * size_of::<ZranInflateContext>();
-            let ptr = state
-                .blob_meta_file_map
-                .validate_range(zran_offset, zran_size)?;
-            let array = unsafe {
-                Vec::from_raw_parts(
-                    ptr as *mut u8 as *mut ZranInflateContext,
-                    zran_count,
-                    zran_count,
-                )
-            };
-            state.zran_info_array = ManuallyDrop::new(array);
-
-            let zran_dict_size = ci_zran_size - zran_size;
-            let ptr = state
-                .blob_meta_file_map
-                .validate_range(zran_offset + zran_size, zran_dict_size)?;
-            let array =
-                unsafe { Vec::from_raw_parts(ptr as *mut u8, zran_dict_size, zran_dict_size) };
-            state.zran_dict_table = ManuallyDrop::new(array);
+            let dict_size = (header.s_ci_zran_size as usize)
+                .checked_sub(zran_size)
+                .ok_or_else(|| einval!("invalid ZRan dictionary size"))?;
+            state.zran_dict_table =
+                unsafe { filemap.get_slice::<u8>(zran_offset + zran_size, dict_size) }?.to_vec();
         }
 
         if load_chunk_digest && blob_info.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST) {
@@ -575,16 +546,8 @@ impl BlobCompressionContextInfo {
             }
 
             let file_map = FileMapState::new(file, 0, size, false)?;
-            let ptr = file_map.validate_range(0, size)?;
-            let array = unsafe {
-                Vec::from_raw_parts(
-                    ptr as *mut u8 as *mut _,
-                    chunk_count as usize,
-                    chunk_count as usize,
-                )
-            };
-            state.chunk_digest_file_map = file_map;
-            state.chunk_digest_array = ManuallyDrop::new(array);
+            state.chunk_digest_array =
+                unsafe { file_map.get_slice::<DigestData>(0, chunk_count as usize) }?.to_vec();
         }
 
         Ok(BlobCompressionContextInfo {
@@ -968,13 +931,11 @@ pub struct BlobCompressionContext {
     pub(crate) blob_features: u32,
     pub(crate) compressed_size: u64,
     pub(crate) uncompressed_size: u64,
-    pub(crate) chunk_info_array: ManuallyDrop<BlobMetaChunkArray>,
-    pub(crate) chunk_digest_array: ManuallyDrop<Vec<DigestData>>,
-    pub(crate) batch_info_array: ManuallyDrop<Vec<BatchInflateContext>>,
-    pub(crate) zran_info_array: ManuallyDrop<Vec<ZranInflateContext>>,
-    pub(crate) zran_dict_table: ManuallyDrop<Vec<u8>>,
-    blob_meta_file_map: FileMapState,
-    chunk_digest_file_map: FileMapState,
+    pub(crate) chunk_info_array: BlobMetaChunkArray,
+    pub(crate) chunk_digest_array: Vec<DigestData>,
+    pub(crate) batch_info_array: Vec<BatchInflateContext>,
+    pub(crate) zran_info_array: Vec<ZranInflateContext>,
+    pub(crate) zran_dict_table: Vec<u8>,
     chunk_digest_default: RafsDigest,
 }
 
@@ -1241,29 +1202,13 @@ impl BlobMetaChunkArray {
 
 impl BlobMetaChunkArray {
     fn from_file_map(filemap: &FileMapState, blob_info: &BlobInfo) -> Result<Self> {
-        let chunk_count = blob_info.chunk_count();
+        let chunk_count = blob_info.chunk_count() as usize;
         if blob_info.has_feature(BlobFeatures::CHUNK_INFO_V2) {
-            let chunk_size = chunk_count as usize * size_of::<BlobChunkInfoV2Ondisk>();
-            let base = filemap.validate_range(0, chunk_size)?;
-            let v = unsafe {
-                Vec::from_raw_parts(
-                    base as *mut u8 as *mut BlobChunkInfoV2Ondisk,
-                    chunk_count as usize,
-                    chunk_count as usize,
-                )
-            };
-            Ok(BlobMetaChunkArray::V2(v))
+            let chunks = unsafe { filemap.get_slice::<BlobChunkInfoV2Ondisk>(0, chunk_count) }?;
+            Ok(BlobMetaChunkArray::V2(chunks.to_vec()))
         } else {
-            let chunk_size = chunk_count as usize * size_of::<BlobChunkInfoV1Ondisk>();
-            let base = filemap.validate_range(0, chunk_size)?;
-            let v = unsafe {
-                Vec::from_raw_parts(
-                    base as *mut u8 as *mut BlobChunkInfoV1Ondisk,
-                    chunk_count as usize,
-                    chunk_count as usize,
-                )
-            };
-            Ok(BlobMetaChunkArray::V1(v))
+            let chunks = unsafe { filemap.get_slice::<BlobChunkInfoV1Ondisk>(0, chunk_count) }?;
+            Ok(BlobMetaChunkArray::V1(chunks.to_vec()))
         }
     }
 
@@ -2116,6 +2061,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn chunk_tables_own_their_loaded_metadata() {
+        use vmm_sys_util::tempfile::TempFile;
+
+        for (features, entry_size) in [
+            (BlobFeatures::empty(), size_of::<BlobChunkInfoV1Ondisk>()),
+            (
+                BlobFeatures::CHUNK_INFO_V2,
+                size_of::<BlobChunkInfoV2Ondisk>(),
+            ),
+        ] {
+            let file = TempFile::new().unwrap();
+            let bytes = vec![0x12; 2 * entry_size];
+            std::fs::write(file.as_path(), &bytes).unwrap();
+            let mapping =
+                FileMapState::new(file.as_file().try_clone().unwrap(), 0, bytes.len(), false)
+                    .unwrap();
+            let info = BlobInfo::new(0, "test".to_owned(), 4096, 4096, 4096, 2, features);
+            let chunks = BlobMetaChunkArray::from_file_map(&mapping, &info).unwrap();
+            drop(mapping);
+            file.as_file().set_len(0).unwrap();
+            assert_eq!(chunks.as_byte_slice(), bytes);
+        }
+    }
+
+    #[test]
     fn test_round_up_4k() {
         assert_eq!(round_up_4k(0), 0x0u32);
         assert_eq!(round_up_4k(1), 0x1000u32);
@@ -2459,10 +2429,9 @@ pub(crate) mod tests {
 
         let chunk_info_array = vec![chunk0, chunk1, chunk2, chunk3, chunk4];
         let chunk_infos = BlobMetaChunkArray::V2(chunk_info_array);
-        let chunk_infos = ManuallyDrop::new(chunk_infos);
 
         let batch_ctx_array = vec![batch_ctx0, batch_ctx1];
-        let batch_ctxes = ManuallyDrop::new(batch_ctx_array);
+        let batch_ctxes = batch_ctx_array;
 
         let state = BlobCompressionContext {
             chunk_info_array: chunk_infos,

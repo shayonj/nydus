@@ -153,7 +153,6 @@ impl BlobMetaChunkInfo for BlobChunkInfoV1Ondisk {
 mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::mem::ManuallyDrop;
     use std::sync::Arc;
 
     use nydus_utils::compress;
@@ -216,7 +215,7 @@ mod tests {
     #[test]
     fn test_get_chunk_index_with_hole() {
         let state = BlobCompressionContext {
-            chunk_info_array: ManuallyDrop::new(BlobMetaChunkArray::V1(vec![
+            chunk_info_array: BlobMetaChunkArray::V1(vec![
                 BlobChunkInfoV1Ondisk {
                     uncomp_info: u64::to_le(0x01ff_f000_0000_0000),
                     comp_info: u64::to_le(0x00ff_f000_0000_0000),
@@ -225,7 +224,7 @@ mod tests {
                     uncomp_info: u64::to_le(0x01ff_f000_0010_0000),
                     comp_info: u64::to_le(0x00ff_f000_0010_0000),
                 },
-            ])),
+            ]),
             ..Default::default()
         };
 
@@ -278,7 +277,7 @@ mod tests {
             blob_features: 0,
             compressed_size: 0x6001,
             uncompressed_size: 0x102001,
-            chunk_info_array: ManuallyDrop::new(BlobMetaChunkArray::V1(vec![
+            chunk_info_array: BlobMetaChunkArray::V1(vec![
                 BlobChunkInfoV1Ondisk {
                     uncomp_info: u64::to_le(0x0100_0000_0000_0000),
                     comp_info: u64::to_le(0x00ff_f000_0000_0000),
@@ -299,7 +298,7 @@ mod tests {
                     uncomp_info: u64::to_le(0x01ff_f000_0010_2000),
                     comp_info: u64::to_le(0x00ff_f000_0000_5000),
                 },
-            ])),
+            ]),
             ..Default::default()
         };
         let info = BlobCompressionContextInfo {

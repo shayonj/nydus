@@ -1915,10 +1915,9 @@ mod tests {
 
         let chunk_info_array = vec![chunk0, chunk1];
         let chunk_infos = BlobMetaChunkArray::V2(chunk_info_array);
-        let chunk_infos = ManuallyDrop::new(chunk_infos);
 
         let batch_ctx_array = vec![batch_ctx0];
-        let batch_ctxes = ManuallyDrop::new(batch_ctx_array);
+        let batch_ctxes = batch_ctx_array;
 
         let mut state = BlobCompressionContext::default();
         state.chunk_info_array = chunk_infos;

@@ -342,7 +342,6 @@ impl Display for BlobChunkInfoV2Ondisk {
 mod tests {
     use super::*;
     use crate::meta::BlobMetaChunkArray;
-    use std::mem::ManuallyDrop;
 
     #[test]
     fn test_new_chunk_on_disk() {
@@ -429,7 +428,7 @@ mod tests {
     #[test]
     fn test_get_chunk_index_with_hole() {
         let state = BlobCompressionContext {
-            chunk_info_array: ManuallyDrop::new(BlobMetaChunkArray::V2(vec![
+            chunk_info_array: BlobMetaChunkArray::V2(vec![
                 BlobChunkInfoV2Ondisk {
                     uncomp_info: u64::to_le(0x0100_1fff_0000_0000),
                     comp_info: u64::to_le(0x000f_ff00_0000_0000),
@@ -440,7 +439,7 @@ mod tests {
                     comp_info: u64::to_le(0x001f_ff00_0010_0000),
                     data: 0,
                 },
-            ])),
+            ]),
             ..Default::default()
         };
 
