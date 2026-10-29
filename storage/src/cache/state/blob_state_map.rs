@@ -11,7 +11,9 @@ use std::io::Result;
 use std::sync::{Arc, Condvar, Mutex, WaitTimeoutResult};
 use std::time::Duration;
 
-use crate::cache::state::{BlobRangeMap, ChunkIndexGetter, ChunkMap, IndexedChunkMap, RangeMap};
+use crate::cache::state::{
+    BlobRangeMap, ChunkIndexGetter, ChunkMap, IndexedChunkMap, PendingRange, RangeMap,
+};
 use crate::cache::SINGLE_INFLIGHT_WAIT_TIMEOUT;
 use crate::device::BlobChunkInfo;
 use crate::{StorageError, StorageResult};
@@ -25,6 +27,7 @@ enum Status {
 struct Slot {
     state: Mutex<Status>,
     condvar: Condvar,
+    completion_guarded: bool,
 }
 
 impl Slot {
@@ -32,6 +35,7 @@ impl Slot {
         Slot {
             state: Mutex::new(Status::Inflight),
             condvar: Condvar::new(),
+            completion_guarded: false,
         }
     }
 
@@ -50,6 +54,10 @@ impl Slot {
         let mut tor: WaitTimeoutResult;
 
         while *state == Status::Inflight {
+            if self.completion_guarded {
+                state = self.condvar.wait(state).unwrap();
+                continue;
+            }
             // Do not expect poisoned lock, so unwrap here.
             let r = self.condvar.wait_timeout(state, timeout).unwrap();
             state = r.0;
@@ -181,7 +189,7 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         &self,
         start: Self::I,
         count: Self::I,
-    ) -> Result<Option<Vec<Self::I>>> {
+    ) -> Result<Option<PendingRange<'_, Self::I>>> {
         let pending = match self.c.check_range_ready_and_mark_pending(start, count) {
             Err(e) => return Err(e),
             Ok(None) => return Ok(None),
@@ -193,20 +201,35 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
             }
         };
 
-        let mut res = Vec::with_capacity(pending.len());
         let mut guard = self.inflight_tracer.lock().unwrap();
+        let mut indices = Vec::with_capacity(pending.len());
         for index in pending.iter() {
-            if guard.get(index).is_none() {
-                // Double check to close the window where prior slot was just removed after backend
-                // IO returned.
-                if !self.c.is_range_ready(*index, 1)? {
-                    guard.insert(*index, Arc::new(Slot::new()));
-                    res.push(*index);
-                }
+            if !guard.contains_key(index) && !self.c.is_range_ready(*index, 1)? {
+                indices.push(*index);
             }
         }
-
-        Ok(Some(res))
+        let mut owned = Vec::with_capacity(indices.len());
+        for index in &indices {
+            let slot = Arc::new(Slot {
+                completion_guarded: true,
+                ..Slot::new()
+            });
+            guard.insert(*index, slot.clone());
+            owned.push((*index, slot));
+        }
+        drop(guard);
+        Ok(Some(PendingRange::owned(indices, move || {
+            let mut guard = self.inflight_tracer.lock().unwrap();
+            for (index, slot) in owned {
+                if guard
+                    .get(&index)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                {
+                    guard.remove(&index);
+                    slot.done();
+                }
+            }
+        })))
     }
 
     fn set_range_ready_and_clear_pending(&self, start: Self::I, count: Self::I) -> Result<()> {
@@ -273,7 +296,7 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
         &self,
         start: Self::I,
         count: Self::I,
-    ) -> Result<Option<Vec<Self::I>>> {
+    ) -> Result<Option<PendingRange<'_, Self::I>>> {
         let pending = match self.c.check_range_ready_and_mark_pending(start, count) {
             Err(e) => return Err(e),
             Ok(None) => return Ok(None),
@@ -285,20 +308,35 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
             }
         };
 
-        let mut res = Vec::with_capacity(pending.len());
         let mut guard = self.inflight_tracer.lock().unwrap();
+        let mut indices = Vec::with_capacity(pending.len());
         for index in pending.iter() {
-            if guard.get(index).is_none() {
-                // Double check to close the window where prior slot was just removed after backend
-                // IO returned.
-                if !self.c.is_range_ready(*index, 1)? {
-                    guard.insert(*index, Arc::new(Slot::new()));
-                    res.push(*index);
-                }
+            if !guard.contains_key(index) && !self.c.is_range_ready(*index, 1)? {
+                indices.push(*index);
             }
         }
-
-        Ok(Some(res))
+        let mut owned = Vec::with_capacity(indices.len());
+        for index in &indices {
+            let slot = Arc::new(Slot {
+                completion_guarded: true,
+                ..Slot::new()
+            });
+            guard.insert(*index, slot.clone());
+            owned.push((*index, slot));
+        }
+        drop(guard);
+        Ok(Some(PendingRange::owned(indices, move || {
+            let mut guard = self.inflight_tracer.lock().unwrap();
+            for (index, slot) in owned {
+                if guard
+                    .get(&index)
+                    .is_some_and(|current| Arc::ptr_eq(current, &slot))
+                {
+                    guard.remove(&index);
+                    slot.done();
+                }
+            }
+        })))
     }
 
     fn set_range_ready_and_clear_pending(&self, start: Self::I, count: Self::I) -> Result<()> {
@@ -771,6 +809,109 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn range_owner_drop_releases_waiters() {
+        let tmp_file = TempFile::new().unwrap();
+        let map = Arc::new(BlobStateMap::from(
+            IndexedChunkMap::new(tmp_file.as_path().to_str().unwrap(), 2, true).unwrap(),
+        ));
+        let pending = map
+            .check_range_ready_and_mark_pending(0, 1)
+            .unwrap()
+            .unwrap();
+        let observer = map
+            .check_range_ready_and_mark_pending(0, 1)
+            .unwrap()
+            .unwrap();
+        assert!(observer.is_empty());
+        drop(observer);
+        assert_eq!(map.inflight_tracer.lock().unwrap().len(), 1);
+        let waiting = map.inflight_tracer.lock().unwrap().get(&0).unwrap().clone();
+        let (done, completed) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            done.send(waiting.wait_for_inflight(Duration::from_secs(1)))
+                .unwrap();
+        });
+        drop(pending);
+        assert!(
+            completed
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                == Status::Complete
+        );
+        waiter.join().unwrap();
+        assert!(map.inflight_tracer.lock().unwrap().is_empty());
+        let successor = map
+            .check_range_ready_and_mark_pending(0, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*successor, &[0]);
+    }
+
+    #[test]
+    fn abandoned_range_wakes_waiters_and_preserves_successors() {
+        let tmp_file = TempFile::new().unwrap();
+        let map = Arc::new(BlobStateMap::from(
+            IndexedChunkMap::new(tmp_file.as_path().to_str().unwrap(), 2, true).unwrap(),
+        ));
+        let original = map
+            .check_range_ready_and_mark_pending(0, 1)
+            .unwrap()
+            .unwrap();
+        let slot = map.inflight_tracer.lock().unwrap().get(&0).unwrap().clone();
+        let (done, completed) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            done.send(slot.wait_for_inflight(Duration::from_secs(1)).unwrap())
+                .unwrap();
+        });
+        map.clear_range_pending(0, 1);
+        let successor = map
+            .check_range_ready_and_mark_pending(0, 1)
+            .unwrap()
+            .unwrap();
+        let current = map.inflight_tracer.lock().unwrap().get(&0).unwrap().clone();
+        drop(original);
+        assert!(Arc::ptr_eq(
+            map.inflight_tracer.lock().unwrap().get(&0).unwrap(),
+            &current
+        ));
+        assert!(completed.recv_timeout(Duration::from_secs(1)).unwrap() == Status::Complete);
+        waiter.join().unwrap();
+        drop(successor);
+        assert!(map.inflight_tracer.lock().unwrap().is_empty());
+        assert!(!map.is_range_ready(0, 1).unwrap());
+    }
+
+    #[test]
+    fn range_waits_for_its_active_producer() {
+        let tmp_file = TempFile::new().unwrap();
+        let map = Arc::new(BlobStateMap::from(
+            IndexedChunkMap::new(tmp_file.as_path().to_str().unwrap(), 2, true).unwrap(),
+        ));
+        let pending = map
+            .check_range_ready_and_mark_pending(0, 1)
+            .unwrap()
+            .unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let waiting = map.clone();
+        let waiter = thread::spawn(move || {
+            done.send(waiting.wait_for_range_ready(0, 1)).unwrap();
+        });
+        let premature = completed.recv_timeout(Duration::from_millis(4200)).ok();
+        map.set_range_ready_and_clear_pending(0, 1).unwrap();
+        drop(pending);
+        waiter.join().unwrap();
+        assert!(
+            premature.is_none(),
+            "active producer was reported as failed"
+        );
+        assert!(completed
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap());
+    }
+
+    #[test]
     fn test_inflight_tracer_race_range() {
         let tmp_file = TempFile::new().unwrap();
         let map = Arc::new(BlobStateMap::from(
@@ -781,17 +922,22 @@ pub(crate) mod tests {
         assert!(!map.is_range_ready(0, 1).unwrap());
         assert!(!map.is_range_ready(9, 1).unwrap());
         assert!(map.is_range_ready(10, 1).is_err());
-        assert_eq!(
-            map.check_range_ready_and_mark_pending(0, 2).unwrap(),
-            Some(vec![0, 1])
-        );
+        let pending = map
+            .check_range_ready_and_mark_pending(0, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*pending, &[0, 1]);
         map.set_range_ready_and_clear_pending(0, 2).unwrap();
-        assert_eq!(map.check_range_ready_and_mark_pending(0, 2).unwrap(), None);
+        assert!(map
+            .check_range_ready_and_mark_pending(0, 2)
+            .unwrap()
+            .is_none());
         map.wait_for_range_ready(0, 2).unwrap();
-        assert_eq!(
-            map.check_range_ready_and_mark_pending(1, 2).unwrap(),
-            Some(vec![2])
-        );
+        let next = map
+            .check_range_ready_and_mark_pending(1, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*next, &[2]);
         map.set_range_ready_and_clear_pending(2, 1).unwrap();
         map.set_range_ready_and_clear_pending(3, 7).unwrap();
         assert!(map.is_range_ready(0, 1).unwrap());

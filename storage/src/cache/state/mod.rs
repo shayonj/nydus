@@ -102,6 +102,50 @@ pub trait ChunkMap: Any + Send + Sync {
     }
 }
 
+/// Releases only the pending entries this range claimed, including when its producer fails.
+pub struct PendingRange<'a, I> {
+    indices: Vec<I>,
+    release: Option<Box<dyn FnOnce() + Send + 'a>>,
+}
+
+impl<'a, I> PendingRange<'a, I> {
+    fn new(indices: Vec<I>) -> Self {
+        Self {
+            indices,
+            release: None,
+        }
+    }
+
+    fn owned(indices: Vec<I>, release: impl FnOnce() + Send + 'a) -> Self {
+        Self {
+            indices,
+            release: Some(Box::new(release)),
+        }
+    }
+}
+
+impl<I> std::ops::Deref for PendingRange<'_, I> {
+    type Target = [I];
+
+    fn deref(&self) -> &[I] {
+        &self.indices
+    }
+}
+
+impl<I: std::fmt::Debug> std::fmt::Debug for PendingRange<'_, I> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.indices.fmt(formatter)
+    }
+}
+
+impl<I> Drop for PendingRange<'_, I> {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 /// Trait to track chunk or data readiness state.
 ///
 /// A `RangeMap` object tracks readiness state of a chunk or data range, indexed by chunk index or
@@ -130,11 +174,12 @@ pub trait RangeMap: Send + Sync {
     /// - clear_range_pending() to clear the pending state without marking data or chunks as ready.
     /// - wait_for_range_ready() to wait for all data or chunks to clear pending state, including
     ///   data or chunks marked as pending by other threads.
+    /// Keep the returned guard until the producer finishes; dropping it releases its pending entries.
     fn check_range_ready_and_mark_pending(
         &self,
         _start: Self::I,
         _count: Self::I,
-    ) -> Result<Option<Vec<Self::I>>> {
+    ) -> Result<Option<PendingRange<'_, Self::I>>> {
         Err(enosys!())
     }
 

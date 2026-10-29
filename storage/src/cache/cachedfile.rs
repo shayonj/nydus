@@ -962,14 +962,7 @@ impl FileCacheEntry {
                         for idx in start_idx..=end_idx {
                             let mut buf = match bufs.next() {
                                 None => return Err(einval!("invalid chunk decompressed status")),
-                                Some(Err(e)) => {
-                                    for idx in idx..=end_idx {
-                                        if status[idx] {
-                                            bitmap.clear_range_pending(chunks[idx].id(), 1)
-                                        }
-                                    }
-                                    return Err(e);
-                                }
+                                Some(Err(e)) => return Err(e),
                                 Some(Ok(v)) => v,
                             };
 
@@ -982,14 +975,7 @@ impl FileCacheEntry {
                         }
                     }
                 }
-                Err(e) => {
-                    for idx in 0..chunks.len() {
-                        if status[idx] {
-                            bitmap.clear_range_pending(chunks[idx].id(), 1)
-                        }
-                    }
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1003,21 +989,19 @@ impl FileCacheEntry {
 
             // if we are in on-demand path, retry for the timeout chunks
             for chunk in chunks {
-                match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
-                    Err(e) => return Err(eio!(format!("do_fetch_chunks failed, {:?}", e))),
-                    Ok(true) => {}
-                    Ok(false) => {
-                        info!("retry for timeout chunk, {}", chunk.id());
+                let retry = bitmap.check_range_ready_and_mark_pending(chunk.id(), 1)?;
+                if let Some(ref pending) = retry {
+                    if !pending.is_empty() {
                         let mut buf = alloc_buf(chunk.uncompressed_size() as usize);
                         self.read_chunk_from_backend(chunk.as_ref(), &mut buf)
-                            .map_err(|e| {
-                                self.update_chunk_pending_status(chunk.as_ref(), false);
-                                eio!(format!("read_raw_chunk failed, {:?}", e))
-                            })?;
+                            .map_err(|e| eio!(format!("read_raw_chunk failed, {:?}", e)))?;
                         if self.dio_enabled {
                             self.adjust_buffer_for_dio(&mut buf)
                         }
                         self.persist_chunk_data(chunk.as_ref(), &buf);
+                    }
+                    if !bitmap.wait_for_range_ready(chunk.id(), 1)? {
+                        return Err(eio!("chunk producer failed"));
                     }
                 }
             }
