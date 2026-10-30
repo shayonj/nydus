@@ -940,42 +940,34 @@ impl FileCacheEntry {
                 chunks[0].blob_index()
             );
 
-            match self.read_chunks_from_backend(
+            let mut bufs = self.read_chunks_from_backend(
                 blob_offset,
                 blob_size,
                 &chunks[start_idx..=end_idx],
                 prefetch,
-            ) {
-                Ok(mut bufs) => {
-                    if self.is_raw_data {
-                        let res = Self::persist_cached_data(
-                            &self.file,
-                            blob_offset,
-                            bufs.compressed_buf(),
-                        );
-                        for idx in start_idx..=end_idx {
-                            if status[idx] {
-                                self.update_chunk_pending_status(chunks[idx].as_ref(), res.is_ok());
-                            }
-                        }
-                    } else {
-                        for idx in start_idx..=end_idx {
-                            let mut buf = match bufs.next() {
-                                None => return Err(einval!("invalid chunk decompressed status")),
-                                Some(Err(e)) => return Err(e),
-                                Some(Ok(v)) => v,
-                            };
-
-                            if status[idx] {
-                                if self.dio_enabled {
-                                    self.adjust_buffer_for_dio(&mut buf)
-                                }
-                                self.persist_chunk_data(chunks[idx].as_ref(), buf.as_ref());
-                            }
-                        }
+            )?;
+            if self.is_raw_data {
+                let res = Self::persist_cached_data(&self.file, blob_offset, bufs.compressed_buf());
+                for idx in start_idx..=end_idx {
+                    if status[idx] {
+                        self.update_chunk_pending_status(chunks[idx].as_ref(), res.is_ok());
                     }
                 }
-                Err(e) => return Err(e),
+            } else {
+                for idx in start_idx..=end_idx {
+                    let mut buf = match bufs.next() {
+                        None => return Err(einval!("invalid chunk decompressed status")),
+                        Some(Err(e)) => return Err(e),
+                        Some(Ok(v)) => v,
+                    };
+
+                    if status[idx] {
+                        if self.dio_enabled {
+                            self.adjust_buffer_for_dio(&mut buf)
+                        }
+                        self.persist_chunk_data(chunks[idx].as_ref(), buf.as_ref());
+                    }
+                }
             }
         }
 

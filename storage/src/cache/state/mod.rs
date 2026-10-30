@@ -174,6 +174,7 @@ pub trait RangeMap: Send + Sync {
     /// - clear_range_pending() to clear the pending state without marking data or chunks as ready.
     /// - wait_for_range_ready() to wait for all data or chunks to clear pending state, including
     ///   data or chunks marked as pending by other threads.
+    ///
     /// Keep the returned guard until the producer finishes; dropping it releases its pending entries.
     fn check_range_ready_and_mark_pending(
         &self,
